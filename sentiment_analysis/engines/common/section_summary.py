@@ -1,0 +1,88 @@
+"""Insight/Media 共享的章节摘要节点基类"""
+import json
+from typing import Any
+from loguru import logger
+
+from langchain_core.prompts import PromptTemplate
+
+from sentiment_analysis.engines.common.research_graph_runtime import ResearchNode
+from sentiment_analysis.engines.contract.agent_role import display_agent_name
+from sentiment_analysis.engines.contract.events import publish_section_ready
+from sentiment_analysis.engines.contract.evidence import build_evidence_context, EvidenceContext, EvidenceRecord
+from sentiment_analysis.engines.contract.section_definitions import find_section_definition
+from sentiment_analysis.engines.prompts.shared import SECTION_SUMMARY_USER_PROMPT
+
+
+class BaseSectionSummaryNode(ResearchNode):
+    """章节摘要节点基类:游标推进、证据组装、LLM 生成摘要与事件发布"""
+
+    system_prompt: str = ""
+    user_prompt_template: str = SECTION_SUMMARY_USER_PROMPT
+    fallback_body: str = ""
+
+    async def __call__(self, state: dict[str, Any]) -> dict[str, Any]:
+        """按游标取证据包生成章节正文并发布就绪事件"""
+        agent_name = display_agent_name(self.context.role)
+        logger.info(f"{agent_name} 开始初始化固定章节并为各章节选择、排序和截取证据。")
+
+        cursor = state.get("cursor", 0)
+        sections = list(state.get("sections"))
+        if cursor >= len(sections):
+            return {"sections": sections}
+
+        section = sections[cursor]
+
+        section_records = self._section_records(state, cursor)
+        if not section_records:
+            logger.info(f"【章节 {section.get('section_key')} 证据上下文为空,跳过生成。")
+            section["body"] = self.fallback_body
+        else:
+            evidence_context = build_evidence_context(
+                retrieval_text=self._retrieval_text(state, cursor),
+                records=section_records
+            )
+            section["body"] = await self._generate_section_body(
+                section,
+                evidence_context,
+            )
+        # 发布数据：角色与任务 ID 从共享上下文取，图状态里没有这两个通道
+        publish_section_ready(section, self.context.role, self.context.task_id)
+
+        sections[cursor] = section
+        return {"sections": sections, "cursor": cursor + 1}
+
+    def _section_records(self, state: dict[str, Any], cursor: int) -> list[EvidenceRecord]:
+        """取当前游标章节的证据记录,缺省返回空列表"""
+        section_records = state.get("section_evidence_records")
+        return section_records[cursor]
+
+    def _retrieval_text(self, state: dict[str, Any], cursor: int) -> str:
+        """章节证据对应的检索文本，默认取研究主题"""
+        # query 未在 ResearchGraphState 中声明，LangGraph 会把它从状态里过滤掉；
+        # 运行上下文在整张图中共享，直接从这里取
+        return self.context.query
+
+    async def _generate_section_body(
+            self,
+            section: dict[str, Any],
+            evidence_context: EvidenceContext
+    ) -> str:
+        """调用 LLM 生成章节正文并清洗 Markdown"""
+        section_key = section["section_key"]
+        section_definition = find_section_definition(section_key)
+
+        section_context = {
+            "title": section.get("title"),
+            "section_key": section_key,
+            "section_guidance": section_definition.section_guidance_for(self.context.role)
+        }
+
+        user_prompt = PromptTemplate.from_template(template=self.user_prompt_template).format(
+            retrieval_text=evidence_context.retrieval_text,
+            section_context=json.dumps(section_context, ensure_ascii=False, indent=2),
+            evidence_text=evidence_context.evidence_text,
+        )
+
+        body = await self.context.llm_client.generate_text(self.system_prompt, user_prompt)
+
+        return body
