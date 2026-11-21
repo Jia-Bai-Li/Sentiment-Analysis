@@ -1,0 +1,105 @@
+from langchain.chat_models import init_chat_model
+from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import SystemMessage, HumanMessage, BaseMessage
+from atguigu.engines.contract.settings import get_settings
+from atguigu.engines.contract.agent_role import RoleKey, ROLE_INFOS
+from typing import Any, TypeVar
+import asyncio
+from atguigu.engines.common.retries import with_retry
+
+T = TypeVar("T")
+
+class LLMClient:
+     def __init__(self,
+                  api_key: str,
+                  model_name: str,
+                  base_url: str,
+                  model_provider: str) -> None:
+         self.api_key = api_key
+         self.model_name = model_name
+         self.base_url = base_url
+         self.model_provider = model_provider
+
+     @classmethod
+     def from_role(cls, role: RoleKey) -> "LLMClient":
+         # 1. 获取配置信息：
+         settings = get_settings()
+         # 2. 获取到Agent 配置信息前缀
+         config_prefix = ROLE_INFOS[role].config_prefix
+         # 3. 创建实例对象并返回
+         return cls(
+             api_key=getattr(settings, f"{config_prefix}_API_KEY"),
+             model_name=getattr(settings, f"{config_prefix}_MODEL_NAME"),
+             base_url=getattr(settings, f"{config_prefix}_BASE_URL"),
+             model_provider=getattr(settings, f"{config_prefix}_MODEL_PROVIDER"),
+         )
+
+     # 文本渲染函数
+     async def generate_text(self,
+                            system_prompt: str,
+                            user_prompt: str) -> str:
+         """流式生成纯文本,逐块收集后拼成一个字符串返回。"""
+         # 1. 先构建消息内容:system 设定角色/规则,user 放具体问题
+         message_context = self.build_message_context(system_prompt, user_prompt)
+         # 2. 定义模型
+         chat_model = self.init_chat_object_model()
+         # 用列表收集再 join,避免在循环里反复做字符串拼接
+         final_chunks = []
+         # 3. 生成文本:astream 逐 token 返回,content 可能为空(如思考过程/结束块),需要跳过
+         try:
+             async for chunk in chat_model.astream(message_context):
+                 if text := chunk.content:
+                     final_chunks.append(text)
+         except Exception as exec:
+             raise ValueError(f"{self.model_name}调用失败，异常信息：{str(exec)}")
+         # 返回数据.
+         return "".join(final_chunks)
+
+     def build_message_context(self, system_prompt: str, user_prompt: str) -> list[BaseMessage]:
+         return [
+             SystemMessage(content=system_prompt),
+             HumanMessage(content=user_prompt),
+         ]
+
+     def init_chat_object_model(self, is_structed: bool = False) -> BaseChatModel:
+         # 1. 获取到模型名称
+         model_name = self.model_name.lower()
+         kwargs: dict[str, Any] = {}
+         # 2. 如果是结构化对象，要关闭kimi的思考模式。
+         if is_structed and (model_name in "kimi" or "moonshot" in model_name):
+             kwargs['extra_body'] = {
+                 "thinking": {
+                     "type": "disabled"
+                 }
+             }
+         return init_chat_model(
+             api_key=self.api_key,
+             model=self.model_name,
+             base_url=self.base_url,
+             model_provider=self.model_provider,
+             **kwargs,
+         )
+
+     @with_retry
+     async def generate_object(self,
+                               system_prompt: str,
+                               user_prompt: str,
+                               structed_object: type[T]) -> T:
+         """让模型按 pydantic 模型的定义返回结构化数据,调用方直接拿到该类型的实例。"""
+         # 1. 构建消息
+         message_context = self.build_message_context(system_prompt, user_prompt)
+         # 2. 获取模型:结构化模式下可能需要关闭思考模型
+         chat_model = self.init_chat_object_model(is_structed=True)
+         # 3. 用 json_schema 方式约束输出结构(LangChain 会把 pydantic 模型转成 JSON Schema 发给模型)
+         structed = chat_model.with_structured_output(structed_object, method="json_schema")
+         try:
+             result = await structed.ainvoke(message_context)
+         except Exception as exec:
+             raise ValueError(f"{self.model_name}调用失败，异常信息：{str(exec)}")
+         # ainvoke 返回 None 说明模型没有按 schema 返回,属于异常情况,
+         # 转成 ValueError 交给上层(全局异常处理器会映射成 400)
+         if result is None:
+             raise ValueError(f"{system_prompt} is not a structured output")
+         return result
+
+

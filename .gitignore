@@ -1,0 +1,44 @@
+# Python 编译缓存
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 虚拟环境
+.venv/
+venv/
+env/
+ENV/
+
+# 环境变量（含密钥，绝对不能传）
+.env
+.env.*
+!.env.example
+
+# IDE / 编辑器
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# 日志与运行产物
+logs/
+*.log
+var/
+*.pid
+
+# 测试与覆盖率
+htmlcov/
+.coverage
+coverage.xml
+
+# uv / 包管理缓存（uv.lock 一般保留）
+.uv-cache/
+
+# Jupyter（若有）
+.ipynb_checkpoints/
+
+# 本地数据（舆情原始爬取数据常很大，按需要）
+data/raw/
